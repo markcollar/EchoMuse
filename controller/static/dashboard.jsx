@@ -33,27 +33,6 @@ const API = {
   token: null,
   role: null,
 
-  // Set by App to its logout handler. Every 401 below routes through
-  // `unauthorized()` rather than only the call sites that remember to check,
-  // because the ones that forget do not fail visibly — they retry.
-  //
-  // A left-open tab did exactly that on the EA controller (#359): the 5s poll
-  // caught its own 401 and discarded it, so an expired session produced 1262
-  // consecutive 401s over 13 hours, every 5 seconds, with nothing on screen
-  // saying the session had died. It also cost 21% of the controller's log
-  // ring, which is the half that hurts someone else — a support bundle
-  // collected in that state reaches back hours less far.
-  onUnauthorized: null,
-  _unauthFired: false,
-
-  // Guarded, because every in-flight request 401s at once and the logout
-  // handler's own POST /api/auth/logout would re-enter this.
-  unauthorized() {
-    if (this._unauthFired) return;
-    this._unauthFired = true;
-    if (this.onUnauthorized) this.onUnauthorized();
-  },
-
   headers() {
     const h = { 'Content-Type': 'application/json' };
     if (this.token) h['Authorization'] = `Bearer ${this.token}`;
@@ -62,7 +41,7 @@ const API = {
 
   async get(path) {
     const r = await fetch(ingressPath(path), { headers: this.headers() });
-    if (r.status === 401) { API.unauthorized(); throw { code: 'not_authenticated', status: 401 }; }
+    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     const data = await r.json();
     if (!r.ok) throw data;
     return data;
@@ -70,7 +49,7 @@ const API = {
 
   async post(path, body) {
     const r = await fetch(ingressPath(path), { method: 'POST', headers: this.headers(), body: JSON.stringify(body) });
-    if (r.status === 401) { API.unauthorized(); throw { code: 'not_authenticated', status: 401 }; }
+    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     const data = await r.json();
     if (!r.ok) throw data;
     return data;
@@ -78,7 +57,7 @@ const API = {
 
   async patch(path, body) {
     const r = await fetch(ingressPath(path), { method: 'PATCH', headers: this.headers(), body: JSON.stringify(body) });
-    if (r.status === 401) { API.unauthorized(); throw { code: 'not_authenticated', status: 401 }; }
+    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     const data = await r.json();
     if (!r.ok) throw data;
     return data;
@@ -86,7 +65,7 @@ const API = {
 
   async del(path) {
     const r = await fetch(ingressPath(path), { method: 'DELETE', headers: this.headers() });
-    if (r.status === 401) { API.unauthorized(); throw { code: 'not_authenticated', status: 401 }; }
+    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     const data = await r.json();
     if (!r.ok) throw data;
     return data;
@@ -100,7 +79,7 @@ const API = {
     const h = {};
     if (this.token) h['Authorization'] = `Bearer ${this.token}`;
     const r = await fetch(ingressPath(path), { headers: h });
-    if (r.status === 401) { API.unauthorized(); throw { code: 'not_authenticated', status: 401 }; }
+    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     if (!r.ok) {
       let data = { code: 'error', status: r.status };
       try { data = await r.json(); } catch {}
@@ -115,7 +94,7 @@ const API = {
     const form = new FormData();
     form.append(fieldName, file);
     const r = await fetch(ingressPath(path), { method: 'POST', headers: h, body: form });
-    if (r.status === 401) { API.unauthorized(); throw { code: 'not_authenticated', status: 401 }; }
+    if (r.status === 401) throw { code: 'not_authenticated', status: 401 };
     const data = await r.json();
     if (!r.ok) throw data;
     return data;
@@ -1156,7 +1135,7 @@ function ConnectivityTab({ device, row }) {
 // ─── Device detail modal ──────────────────────────────────────────────────────
 
 function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDeviceConfigChange }) {
-  const [tab, setTab] = useState(() => device.approved ? 'status' : 'approve');
+  const [tab, setTab] = useState('status');
   // Seed from the EFFECTIVE config, not the raw stored one — see
   // effectiveConfig(). A migrated row's stored dict is not the truth.
   const [config, setConfig] = useState(() => effectiveConfig(globalConfig, device));
@@ -1608,27 +1587,18 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               <CircleButton onClick={onClose} title="Close">×</CircleButton>
             </div>
           </div>
-          {device.approved ? (
-            <div className="em-tabs" style={{ display: 'flex', gap: 2 }}>
-              {TABS.map(t => (
-                <button key={t} onClick={() => setTab(t)} style={{ background: tab === t ? 'linear-gradient(180deg,var(--raised),var(--surface))' : 'transparent', border: tab === t ? '1px solid var(--border-hard)' : '1px solid transparent', borderBottom: tab === t ? '1px solid var(--surface)' : '1px solid transparent', borderRadius: '6px 6px 0 0', fontFamily: "'DM Mono',monospace", fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.1em', padding: '7px 14px', cursor: 'pointer', color: tab === t ? 'var(--text)' : 'var(--muted)', marginBottom: -1, transition: 'color 0.15s' }}>{t}</button>
-              ))}
-            </div>
-          ) : (
-            // One tab is not a tab bar — it reads as a label and the approval
-            // form sat behind a click. Pending devices get a banner instead.
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: -1, padding: '9px 14px', background: 'linear-gradient(180deg,var(--accent-tint),var(--surface))', border: '1px solid var(--accent-line)', borderBottom: '1px solid var(--surface)', borderRadius: '6px 6px 0 0', fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: 'var(--accent-deep)', lineHeight: 1.4 }}>
-              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.12em', color: 'var(--warn)', fontWeight: 600, flexShrink: 0 }}>Action required</span>
-              <span>Name this device below, then approve it to add it to your fleet.</span>
-            </div>
-          )}
+          <div className="em-tabs" style={{ display: 'flex', gap: 2 }}>
+            {TABS.map(t => (
+              <button key={t} onClick={() => setTab(t)} style={{ background: tab === t ? 'linear-gradient(180deg,var(--raised),var(--surface))' : 'transparent', border: tab === t ? '1px solid var(--border-hard)' : '1px solid transparent', borderBottom: tab === t ? '1px solid var(--surface)' : '1px solid transparent', borderRadius: '6px 6px 0 0', fontFamily: "'DM Mono',monospace", fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.1em', padding: '7px 14px', cursor: 'pointer', color: tab === t ? 'var(--text)' : 'var(--muted)', marginBottom: -1, transition: 'color 0.15s' }}>{t}</button>
+            ))}
+          </div>
         </div>
 
         {/* Body */}
         <div className="em-modal-body" style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
 
           {/* APPROVE */}
-          {!device.approved && (
+          {tab === 'approve' && (
             <div style={{ maxWidth: 400 }}>
               <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.15em', marginBottom: 16 }}>New Device — Pending Approval</div>
               {row('Serial', device.device_id)}
@@ -1704,37 +1674,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                     })())}
                     {row('Firmware', device.firmware_ver || '—')}
                     {row('WiFi network', s?.wifiSsid || '—')}
-                    {/* Was a bare port number, which answered "which port" and
-                        never the question anyone opens this panel with — is
-                        Home Assistant actually on the other end of it (#349).
-                        A device HA has never connected to is Online, idle and
-                        completely unable to answer, and until this row said so
-                        the only way to find out was to say the wake word and
-                        watch nothing happen. Measured on prod: 23 wake events
-                        in 14 hours that could not start a turn, with three
-                        tiles reading healthy throughout.
-
-                        The port stays, appended: it is what a stale HA config
-                        entry is keyed on, so it is the first thing needed the
-                        moment this row says Waiting. */}
-                    {row('Voice assistant', (() => {
-                      const vs = device.voiceSatellite;
-                      const p  = vs?.port ?? device.esphome_port;
-                      const at = p != null ? ` · port ${p}` : '';
-                      if (!vs)            return 'No satellite server';
-                      if (vs.haConnected) return `HA connected${at}`;
-                      if (vs.listening)   return `Waiting for HA${at}`;
-                      return `Port down${at}`;
-                    })(), (() => {
-                      const vs = device.voiceSatellite;
-                      // Not-connected is amber rather than red: HA reconnects
-                      // on its own from most of the ways this happens, and a
-                      // row that shouts during an ordinary restart is one
-                      // people learn to skip past — the #301 cry-wolf rule.
-                      if (!vs)            return 'var(--error)';
-                      if (vs.haConnected) return 'var(--ok)';
-                      return 'var(--warn)';
-                    })())}
+                    {row('ESPHome port', device.esphome_port != null ? String(device.esphome_port) : '—')}
                     {/* One row, not two. "Connected: Yes" plus "Last seen"
                         was redundant in both directions — while connected the
                         last-seen time says nothing, and while offline the
@@ -5171,37 +5111,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
     { value: 'pride',      label: 'Pride',      swatches: ['#bf0000', '#bf7700', '#a9bf00', '#00bf2c', '#0055bf', '#8b00bf'] },
     { value: 'custom',     label: 'Custom',     swatches: null },
   ];
-  // Measured, not chosen (2026-08-29). The driver was swept in three
-  // placements against the hardware echo reference, and the result agrees with
-  // stock's own FIR to 0.1dB at 315Hz and 0.0dB at 630Hz — two methods sharing
-  // no assumptions (#247). Relative to 1kHz the driver is ~18dB down at 250Hz
-  // and peaks ~+8.9dB at 3150Hz.
-  //
-  // The old presets predate that measurement and one of them was backwards:
-  // 'Clarity' put +7dB on band 5 (3500Hz), which is exactly where the driver
-  // already peaks, landing around +16dB at 3150 — sibilance, not clarity.
-  // 'Warmth' had the right shape and a fraction of the size.
-  //
-  // Bands are [125 shelf, 250, 500, 1000, 2000, 3500, 5500, 8000 shelf].
-  // 125 stays 0 in every preset: it is a SHELF, so lifting it pushes
-  // everything below into the bass guard, which then removes it — the boost
-  // belongs at 250 where the band is a peaking filter. 5500 and 8000 stay 0
-  // on evidence rather than omission: those bands moved up to 13.8dB between
-  // placements, which is more than the whole ±12dB range, so anything set
-  // there tunes one room.
-  const EQ_PRESETS = [
-    // The bypass, and the reference for any A/B. Keep it exactly zero.
-    ['Flat',   [0, 0, 0, 0,  0,  0, 0, 0]],
-    // Gentler low-mid lift than Music: speech carries little energy below
-    // 300Hz, and the boost spends headroom the limiter then reclaims from the
-    // midrange. Keeps most of the driver's natural presence — 2-4kHz carries
-    // consonants — while taking the harsh edge off the 3150 peak.
-    ['Speech', [0, 4, 2, 0, -2, -5, 0, 0]],
-    // The full measured correction, bounded by what this driver will stand.
-    // Stock puts +19.9dB at 250Hz; +8 is the honest fraction our ±12 range and
-    // the limiter leave room for, and it is a value to walk up by ear.
-    ['Music',  [0, 8, 3, 0, -3, -6, 0, 0]],
-  ];
+  const EQ_PRESETS = [['Flat',[0,0,0,0,0,0,0,0]], ['Clarity',[0,0,0,0,0,7,4,2]], ['Warmth',[0,3,2,0,-2,0,0,0]]];
   const activeEqPreset = (EQ_PRESETS.find(([, vals]) => JSON.stringify(vals) === JSON.stringify(bands)) || [null])[0];
 
   const [advMics, setAdvMics] = useState(false);
@@ -5740,6 +5650,40 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
   const [users, setUsers]         = useState(null);
   const [usersMsg, setUsersMsg]   = useState(null);
 
+  // Intercom (em_intercom.py) VOX/relay tuning — separate store from the
+  // per-device DeviceConfigForm above (system_config key/value, not
+  // per-device audio hardware config), so it gets its own fetch/save
+  // rather than piggybacking on `config`/saveGlobalConfig.
+  const [intercomSettings, setIntercomSettings]     = useState(null);
+  const [intercomDirty, setIntercomDirty]           = useState(false);
+  const [intercomSaving, setIntercomSaving]         = useState(false);
+  const [intercomMsg, setIntercomMsg]               = useState(null);
+
+  function loadIntercomSettings() {
+    API.get('/api/intercom/settings').then(s => { setIntercomSettings(s); setIntercomDirty(false); })
+       .catch(e => setIntercomMsg({ ok: false, text: e.error || 'Failed to load intercom settings' }));
+  }
+  useEffect(() => { if (tab === 'intercom') loadIntercomSettings(); }, [tab]);
+
+  function setIntercomConf(k, v) {
+    setIntercomSettings(s => ({ ...s, [k]: v }));
+    setIntercomDirty(true);
+    setIntercomMsg(null);
+  }
+
+  async function saveIntercomSettings() {
+    setIntercomSaving(true);
+    try {
+      const updated = await API.patch('/api/intercom/settings', intercomSettings);
+      setIntercomSettings(updated);
+      setIntercomDirty(false);
+      setIntercomMsg({ ok: true, text: 'Saved — takes effect immediately, no restart needed' });
+    } catch (e) {
+      setIntercomMsg({ ok: false, text: e.error || 'Failed to save intercom settings' });
+    }
+    setIntercomSaving(false);
+  }
+
   function loadUsers() {
     API.get('/api/users').then(setUsers)
        .catch(e => setUsersMsg({ ok: false, text: e.error || 'Failed to load users' }));
@@ -5753,9 +5697,8 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
       setUsers(prev => prev.map(u => u.id === id ? { ...u, role } : u));
       setUsersMsg({ ok: true, text: 'Role updated.' });
     } catch (e) {
-      // The server's only refusal here is the last-admin demotion
-      // (ha_linked is display-only — it never causes a refusal); pass its
-      // reason through rather than a generic failure.
+      // The server refuses the last-admin demotion and explains ha_linked
+      // refusals; pass its reason through rather than a generic failure.
       setUsersMsg({ ok: false, text: e.error || 'Refused.' });
     }
   }
@@ -5822,8 +5765,8 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
 
   // Support is admin-only because the endpoint is: the bundle spans the whole
   // fleet, so a tab a non-admin can only be refused by is worse than no tab.
-  const TABS = isAdmin ? ['fleet', 'users', 'account', 'support'] : ['fleet', 'account'];
-  const TAB_LABELS = { fleet: 'Config', users: 'Users', account: 'Account', support: 'Support' };
+  const TABS = isAdmin ? ['fleet', 'intercom', 'users', 'account', 'support'] : ['fleet', 'account'];
+  const TAB_LABELS = { fleet: 'Config', intercom: 'Intercom', users: 'Users', account: 'Account', support: 'Support' };
 
   return (
     <div style={{ position:'fixed', inset:0, background:'rgba(180,176,168,0.5)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:200, backdropFilter:'blur(8px)' }}
@@ -5869,6 +5812,50 @@ function SettingsPanel({ globalConfig, onGlobalConfigChange, onClose, username, 
                 </div>
               )}
             </>
+          )}
+
+          {tab === 'intercom' && (
+            <div style={{ maxWidth: 480 }}>
+              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:'var(--muted)', marginBottom:20, lineHeight:1.6 }}>
+                Voice-activated (VOX) room-to-room relay tuning. Changes take effect
+                immediately for every device — no restart needed.
+              </div>
+              {!intercomSettings && !intercomMsg && <div className="help">Loading…</div>}
+              {intercomSettings && (
+                <>
+                  <Slider label="Gain" sub="output level of relayed audio — lower reduces feedback/echo risk on the receiving device"
+                    value={intercomSettings.intercom_gain} min={0.1} max={1.0} step={0.05}
+                    onChange={v => setIntercomConf('intercom_gain', v)}/>
+                  <Slider label="Sensitivity threshold" sub="mic RMS above this = speech — lower picks up quieter/farther speech, but is closer to ambient room noise"
+                    value={intercomSettings.vox_rms_threshold} min={100} max={2000} step={10}
+                    onChange={v => setIntercomConf('vox_rms_threshold', v)}/>
+                  <Slider label="Confirm frames" sub="consecutive above-threshold frames (~80ms each) required before opening — higher filters brief noise spikes at the cost of a slower start"
+                    value={intercomSettings.vox_confirm_frames} min={1} max={10} step={1}
+                    onChange={v => setIntercomConf('vox_confirm_frames', v)}/>
+                  <Slider label="Hangover" sub="how long to hold the floor open after speech stops"
+                    value={intercomSettings.vox_hangover_s} min={0.2} max={3.0} step={0.1} unit="s"
+                    onChange={v => setIntercomConf('vox_hangover_s', v)}/>
+                  <Slider label="Max floor time" sub="hard ceiling — force-release after this long regardless of continued triggering, so a stuck feedback/noise loop can't hold the floor forever"
+                    value={intercomSettings.vox_max_floor_s} min={5} max={120} step={5} unit="s"
+                    onChange={v => setIntercomConf('vox_max_floor_s', v)}/>
+                  <Slider label="Listen cooldown" sub="after receiving relayed audio, ignore this device's own mic for this long before it can grab the floor again — reduces echo from acoustic bleed-back"
+                    value={intercomSettings.vox_listen_cooldown_s} min={0} max={2.0} step={0.1} unit="s"
+                    onChange={v => setIntercomConf('vox_listen_cooldown_s', v)}/>
+                  {intercomDirty && (
+                    <div style={{ display:'flex', gap:10, marginTop:24 }}>
+                      <Pill accent disabled={intercomSaving} onClick={saveIntercomSettings}>{intercomSaving ? 'Saving…' : 'Save'}</Pill>
+                      <Pill onClick={loadIntercomSettings}>Revert</Pill>
+                    </div>
+                  )}
+                </>
+              )}
+              {intercomMsg && (
+                <div style={{ marginTop: 14, fontFamily: "'DM Mono',monospace", fontSize: 11,
+                  color: intercomMsg.ok ? 'var(--ok)' : 'var(--error)' }}>
+                  {intercomMsg.ok ? '✓ ' : ''}{intercomMsg.text}
+                </div>
+              )}
+            </div>
           )}
 
           {tab === 'users' && (
@@ -6018,13 +6005,8 @@ function App() {
     location.replace('.');
   }
 
-  // Restore token on mount, and give API somewhere to send a dead session.
-  // handleLogout only clears storage and navigates, so binding the first
-  // render's copy is safe.
-  useEffect(() => {
-    if (token) API.token = token;
-    API.onUnauthorized = handleLogout;
-  }, []);
+  // Restore token on mount
+  useEffect(() => { if (token) API.token = token; }, []);
 
   // Reconcile the cached role against the server's.
   //
@@ -6137,13 +6119,7 @@ function App() {
       }, 5000);
     };
 
-    // Polling fallback — catches anything the WebSocket misses.
-    //
-    // The catch stays broad: a blip must not tear the dashboard down. A dead
-    // session is not a blip, and it is not handled here — API.unauthorized()
-    // has already fired by the time this runs. Before that existed, this line
-    // was where an expired session went to be forgotten, five seconds at a
-    // time, indefinitely.
+    // Polling fallback — catches anything the WebSocket misses
     const poll = setInterval(() => {
       API.get('/api/devices').then(setDevices).catch(() => {});
     }, 5000);
@@ -6440,3 +6416,4 @@ function App() {
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+
