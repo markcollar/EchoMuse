@@ -53,6 +53,7 @@ import websockets
 
 import em_db as db
 import em_auth as auth
+import em_intercom
 import em_ble_proxy
 import em_config_sections as sections_mod
 import em_firmware
@@ -334,6 +335,12 @@ async def create_app() -> web.Application:
     app.router.add_post("/api/devices/{id}/update",       _post_device_update)
     app.router.add_post("/api/devices/{id}/rollback",     _post_device_rollback)
     app.router.add_post("/api/releases/upload",           _post_upload_binary)
+    app.router.add_post("/api/intercom/start",             _post_intercom_start)
+    app.router.add_post("/api/intercom/stop",               _post_intercom_stop)
+    app.router.add_post("/api/intercom/link",               _post_intercom_link)
+    app.router.add_post("/api/intercom/unlink",             _post_intercom_unlink)
+    app.router.add_get("/api/intercom/settings",            _get_intercom_settings)
+    app.router.add_patch("/api/intercom/settings",          _patch_intercom_settings)
 
     # Custom wake-word models (oww_forge output → data/oww_models/)
     app.router.add_get("/api/oww_models",             _get_oww_models)
@@ -952,49 +959,8 @@ async def _delete_device(request: web.Request) -> web.Response:
     await loop.run_in_executor(None, db.delete_device, device_id)
     # Row gone → reconcile tears down any BT proxy listener/mDNS for it.
     await em_ble_proxy.reconcile(device_id)
-    # The satellite needs the same, and had no equivalent: it survives an
-    # ordinary disconnect on purpose, so a delete used to leave it in
-    # `_servers` holding the old port for a re-added device to inherit
-    # silently. Lazy import — em_esphome imports em_api at module level.
-    import em_esphome
-    await em_esphome.device_deleted(device_id)
-    # ...and the device is told to redial, or it never notices it was deleted.
-    # Link auth is decided once, at register time, so a connected device keeps
-    # running on the socket it already has: it vanishes from the dashboard and
-    # carries on serving turns, and only comes back as pending after something
-    # else drops the link — a reboot, a controller restart, a WiFi blip. The
-    # bounce is what makes delete mean "start over" within seconds instead of
-    # whenever. Deliberately AFTER the row is gone: the device redials in 5s
-    # and must find an empty registry, or it re-registers into the row we were
-    # deleting. em_linkauth ignores the token it still carries (rule 3), so it
-    # arrives as pending — except under REQUIRE_DEVICE_TLS, where it is
-    # refused and re-provisioning over USB is the intended path.
-    await _disconnect_device(device_id)
     await _push_event({"type": "device_deleted", "device_id": device_id})
     return _ok({})
-
-
-async def _disconnect_device(device_id: str) -> None:
-    """
-    Close a device's control plane, and any shell session riding on it.
-
-    Only the control plane is closed: the device's own loop cancels its data
-    client when control drops (`control.go` Run) and re-establishes both on
-    the next dial, so closing `/data` here would only race that. The shell
-    plane is separate and demand-opened, so an open session would otherwise
-    hang against a device that is about to redial. `_release_shell_ws` is
-    called even with no programmatic session registered, because the
-    `shell_close` it sends is the only thing that ends an INTERACTIVE
-    dashboard session — those deliberately do not set `_shell_ws`.
-    """
-    live = _devices.get(device_id)
-    if live is None:
-        return
-    await _release_shell_ws(device_id, live)
-    try:
-        await live.control_ws.close()
-    except Exception as e:
-        log.warning(f"[api] Could not close control plane for {device_id}: {e}")
 
 
 @auth.require_admin
@@ -1456,6 +1422,113 @@ async def _post_device_rollback(request: web.Request) -> web.Response:
 
 
 @auth.require_admin
+@auth.require_admin
+async def _post_intercom_start(request: web.Request) -> web.Response:
+    """
+    POST /api/intercom/start
+
+    Body: {from, to, two_way?}
+    Relays live mic audio from `from` to `to`'s speaker (see em_intercom.py).
+    two_way=true also opens the reverse leg (relies on each device's own
+    on-device AEC — see em_intercom module docstring).
+    """
+    body = await _json_body(request)
+    from_id = _require_str(body, "from")
+    to_id   = _require_str(body, "to")
+    two_way = bool(body.get("two_way"))
+
+    try:
+        if two_way:
+            await em_intercom.start_two_way(from_id, to_id)
+        else:
+            await em_intercom.start(from_id, to_id)
+    except ValueError as e:
+        return _error("device_not_connected", str(e), 404)
+
+    return _ok({"from": from_id, "to": to_id, "two_way": two_way})
+
+
+@auth.require_admin
+async def _post_intercom_stop(request: web.Request) -> web.Response:
+    """
+    POST /api/intercom/stop
+
+    Body: {device}
+    Ends any call this device is a party to (either leg).
+    """
+    body = await _json_body(request)
+    device_id = _require_str(body, "device")
+    await em_intercom.stop(device_id)
+    return _ok({"device": device_id})
+
+
+@auth.require_admin
+async def _post_intercom_link(request: web.Request) -> web.Response:
+    """
+    POST /api/intercom/link
+
+    Body: {a, b}
+    Enables hands-free VOX linking between two devices (see em_intercom.py
+    docstring) — whoever speaks is automatically relayed, no command
+    needed per turn. Recommended over two_way for a "just works" intercom,
+    since it never opens both directions simultaneously.
+    """
+    body = await _json_body(request)
+    a_id = _require_str(body, "a")
+    b_id = _require_str(body, "b")
+    try:
+        await em_intercom.link(a_id, b_id)
+    except ValueError as e:
+        return _error("device_not_connected", str(e), 404)
+    return _ok({"a": a_id, "b": b_id})
+
+
+@auth.require_admin
+async def _post_intercom_unlink(request: web.Request) -> web.Response:
+    """
+    POST /api/intercom/unlink
+
+    Body: {device}
+    Disables VOX linking for this device and its partner.
+    """
+    body = await _json_body(request)
+    device_id = _require_str(body, "device")
+    await em_intercom.unlink(device_id)
+    return _ok({"device": device_id})
+
+
+@auth.require_admin
+async def _get_intercom_settings(request: web.Request) -> web.Response:
+    """
+    GET /api/intercom/settings
+
+    Returns the current live VOX/relay tuning settings — intercom_gain,
+    vox_rms_threshold, vox_confirm_frames, vox_hangover_s, vox_max_floor_s,
+    vox_listen_cooldown_s.
+    """
+    return _ok(em_intercom.get_settings())
+
+
+@auth.require_admin
+async def _patch_intercom_settings(request: web.Request) -> web.Response:
+    """
+    PATCH /api/intercom/settings
+
+    Body: any subset of the settings returned by GET, e.g.
+    {"vox_rms_threshold": 450, "vox_hangover_s": 1.0}. Takes effect
+    immediately (no restart) and persists across restarts. Unknown keys
+    are rejected with a 400 rather than silently ignored.
+    """
+    body = await _json_body(request)
+    if not isinstance(body, dict) or not body:
+        return _error("invalid_body", "expected a non-empty JSON object of settings", 400)
+    try:
+        updated = em_intercom.update_settings(body)
+    except ValueError as e:
+        return _error("unknown_setting", str(e), 400)
+    return _ok(updated)
+
+
 async def _post_upload_binary(request: web.Request) -> web.Response:
     """
     POST /api/releases/upload (multipart: field name "binary")
@@ -4656,11 +4729,6 @@ def _merge_device(row) -> dict:
     """
     device_id = row["device_id"]
     live = _devices.get(device_id)
-    # Lazy, for the reason every other em_esphome call site here is lazy:
-    # em_esphome imports em_api at module level. After the first call this
-    # is a sys.modules lookup, which is what makes it affordable on a path
-    # that runs per device per dashboard poll.
-    import em_esphome
 
     return {
         # Persistent
@@ -4698,12 +4766,6 @@ def _merge_device(row) -> dict:
         # Controller-side BT proxy state — non-None only while the device's
         # bleProxyEnabled config has a proxy server instantiated.
         "bleProxy":         em_ble_proxy.get_status(device_id),
-        # Controller-side voice satellite state: whether Home Assistant is
-        # actually on the other end of this device's ESPHome port. Without
-        # it a device HA has never connected to renders as idle, which is
-        # the same thing a working device renders as (#349) — the wake word
-        # fires, the ring lights, and the turn dies in milliseconds.
-        "voiceSatellite":   em_esphome.get_status(device_id),
         # Device-link security: token issued (persistent) + whether the
         # current control connection came in over the TLS listener (live).
         "linkTokenIssued":  bool(row["token"]) if "token" in row.keys() else False,
